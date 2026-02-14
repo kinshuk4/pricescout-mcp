@@ -51,7 +51,18 @@ class Configuration:
             JSONDecodeError: If configuration file is invalid JSON.
             ValueError: If configuration file is missing required fields.
         """
-        # complete
+        try:
+            with open(file_path, 'r') as f:
+                config = json.load(f)
+
+            if "mcpServers" not in config:
+                raise ValueError("Configuration file is missing 'mcpServers' field")
+
+            return config
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Configuration file not found: {file_path}")
+        except json.JSONDecodeError as e:
+            raise json.JSONDecodeError(f"Invalid JSON in configuration file: {e.msg}", e.doc, e.pos)
 
     @property
     def anthropic_api_key(self) -> str:
@@ -85,8 +96,11 @@ class Server:
         if command is None:
             raise ValueError("The command must be a valid string and cannot be None.")
 
-        # complete params
-        server_params = StdioServerParameters()
+        server_params = StdioServerParameters(
+            command=command,
+            args=self.config["args"],
+            env={**os.environ, **self.config["env"]} if self.config.get("env") else None
+        )
         try:
             stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
             read, write = stdio_transport
@@ -108,7 +122,21 @@ class Server:
         Raises:
             RuntimeError: If the server is not initialized.
         """
-        # complete
+        if not self.session:
+            raise RuntimeError(f"Server '{self.name}' is not initialized")
+
+        tools_response = await self.session.list_tools()
+        tools: List[ToolDefinition] = []
+
+        for tool in tools_response.tools:
+            tool_def: ToolDefinition = {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.inputSchema
+            }
+            tools.append(tool_def)
+
+        return tools
 
     async def execute_tool(
         self,
@@ -132,7 +160,26 @@ class Server:
             RuntimeError: If server is not initialized.
             Exception: If tool execution fails after all retries.
         """
-        # complete
+        if not self.session:
+            raise RuntimeError(f"Server '{self.name}' is not initialized")
+
+        last_exception = None
+        for attempt in range(retries + 1):
+            try:
+                logging.info(f"Executing {tool_name}...")
+                result = await self.session.call_tool(
+                    name=tool_name,
+                    arguments=arguments,
+                    read_timeout_seconds=timedelta(seconds=60)
+                )
+                return result
+            except Exception as e:
+                last_exception = e
+                logging.warning(f"Attempt {attempt + 1} failed for {tool_name}: {e}")
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+
+        raise last_exception
 
     async def cleanup(self) -> None:
         """Clean up server resources."""
@@ -233,8 +280,22 @@ class DataExtractor:
             pricing_data = json.loads(extraction_response)
             
             for plan in pricing_data.get("plans", []):
-                # complete
-            
+                await self.sqlite_server.execute_tool("write_query", {
+                    "query": f"""
+                    INSERT INTO pricing_plans (company_name, plan_name, input_tokens, output_tokens, currency, billing_period, features, limitations, source_query)
+                    VALUES (
+                        '{pricing_data.get("company_name", "Unknown")}',
+                        '{plan.get("plan_name", "Unknown Plan")}',
+                        '{plan.get("input_tokens", 0)}',
+                        '{plan.get("output_tokens", 0)}',
+                        '{plan.get("currency", "USD")}',
+                        '{plan.get("billing_period", "unknown")}',
+                        '{json.dumps(plan.get("features", []))}',
+                        '{plan.get("limitations", "")}',
+                        '{user_query}')
+                    """
+                })
+
             logger.info(f"Stored {len(pricing_data.get('plans', []))} pricing plans")
             
         except Exception as e:
@@ -265,24 +326,95 @@ class ChatSession:
         messages = [{'role': 'user', 'content': query}]
         response = self.anthropic.messages.create(
             max_tokens=2024,
-            model='<ENTER_MODEL_NAME>', 
+            model='claude-sonnet-4-5-20250929',
             tools=self.available_tools,
             messages=messages
         )
-        
+
         full_response = ""
         source_url = None
         used_web_search = False
-        
+
         process_query = True
         while process_query:
             assistant_content = []
             for content in response.content:
                 if content.type == 'text':
-                    # complete
+                    # Add text to response
+                    full_response += content.text + "\n"
+                    assistant_content.append(content)
+
+                    # If this is the only content, we're done
+                    if len(response.content) == 1:
+                        print(content.text)
+                        process_query = False
+
                 elif content.type == 'tool_use':
-                    # complete
-        
+                    # Append the tool use request to messages
+                    assistant_content.append(content)
+
+                    # Extract tool information
+                    tool_id = content.id
+                    tool_name = content.name
+                    tool_args = content.input
+
+                    logger.info(f"Tool requested: {tool_name}")
+
+                    # Find which server has this tool
+                    server_name = self.tool_to_server.get(tool_name)
+                    if not server_name:
+                        logger.error(f"No server found for tool: {tool_name}")
+                        continue
+
+                    # Find the server object
+                    server = next((s for s in self.servers if s.name == server_name), None)
+                    if not server:
+                        logger.error(f"Server {server_name} not found")
+                        continue
+
+                    # Execute the tool
+                    try:
+                        result = await server.execute_tool(tool_name, tool_args)
+
+                        # Extract URL if this was a web search or scrape
+                        result_text = str(result.content[0].text if result.content else "")
+                        if not source_url:
+                            source_url = self._extract_url_from_result(result_text)
+
+                        logger.info(f"Tool {tool_name} completed")
+
+                    except Exception as e:
+                        logger.error(f"Tool execution failed: {e}")
+                        result_text = f"Error: {str(e)}"
+                        result = type('obj', (object,), {'content': [type('obj', (object,), {'text': result_text})()]})()
+
+                    # Append messages for next iteration
+                    messages.append({'role': 'assistant', 'content': assistant_content})
+                    messages.append({
+                        'role': 'user',
+                        'content': [{
+                            'type': 'tool_result',
+                            'tool_use_id': tool_id,
+                            'content': result.content[0].text if result.content else ""
+                        }]
+                    })
+
+                    # Call the model again with the tool result
+                    response = self.anthropic.messages.create(
+                        max_tokens=2024,
+                        model='claude-sonnet-4-5-20250929',
+                        tools=self.available_tools,
+                        messages=messages
+                    )
+
+                    # Check if the new response is just text (no more tools)
+                    if len(response.content) == 1 and response.content[0].type == 'text':
+                        print(response.content[0].text)
+                        full_response += response.content[0].text + "\n"
+                        process_query = False
+
+                    break  # Exit the for loop to process new response
+
         if self.data_extractor and full_response.strip():
             await self.data_extractor.extract_and_store_data(query, full_response.strip(), source_url)
 
@@ -321,9 +453,26 @@ class ChatSession:
         if not self.sqlite_server:
             logger.info("No database available")
             return
-            
+
         try:
-            # complete
+            pricing = await self.sqlite_server.execute_tool("read_query", {
+                "query": "SELECT company_name, plan_name, input_tokens, output_tokens, currency FROM pricing_plans ORDER BY created_at DESC LIMIT 5"
+            })
+
+            print("\nRecently Stored Data:")
+            print("=" * 50)
+
+            print("\nPricing Plans:")
+            # The result.content is a list with one item, a dict, where the 'text' key holds the rows
+            if pricing.content and len(pricing.content) > 0:
+                result_text = pricing.content[0].text
+                # Parse the result (it comes as a formatted string from SQLite MCP server)
+                print(result_text)
+            else:
+                print("  No pricing data stored yet.")
+
+            print("=" * 50)
+
         except Exception as e:
             print(f"Error showing data: {e}")
 
@@ -363,9 +512,10 @@ class ChatSession:
 async def main() -> None:
     """Initialize and run the chat session."""
     config = Configuration()
-    
-    script_dir = Path(__file__).parent
-    config_file = script_dir / "server_config.json"
+
+    # Config is in conf/ folder (parent of src/)
+    project_root = Path(__file__).parent.parent
+    config_file = project_root / "conf" / "server_config.json"
     
     server_config = config.load_config(config_file)
     
