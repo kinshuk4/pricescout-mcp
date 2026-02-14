@@ -210,3 +210,4 @@ __marimo__/
 test.db
 scraped_content/
 *.db
+.DS_Store
